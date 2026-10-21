@@ -1,0 +1,1161 @@
+#!/usr/bin/env python3
+"""Per-user QEMU lifecycle dispenser for Android guests and serialized stdio MCP proxy (Python 3.10+)."""
+import argparse
+import base64
+import contextlib
+import ctypes
+import fcntl
+import hashlib
+import json
+import os
+from pathlib import Path
+import queue
+import re
+import selectors
+import secrets
+import shlex
+import shutil
+import signal
+import socket
+import subprocess
+import sys
+import threading
+import tempfile
+import time
+import uuid
+
+ROOT = Path(__file__).resolve().parent
+STATE = Path(os.environ.get('ANDROID_VM_DISPENSER_STATE', ROOT / 'state')).resolve()
+IDLE_SEC = 300
+DISCONNECT_GRACE_SEC = 15
+CONFIG = Path(os.environ.get('ANDROID_VM_DISPENSER_CONFIG', ROOT / 'config.json')).resolve()
+TOOLS = [
+ {'name':'upload','description':'Upload a file from the MCP host to this leased Android guest via adb push. Parent directory must exist. Paths must be absolute. Returns SHA256 and byte count.', 'inputSchema':{'type':'object','properties':{'local_path':{'type':'string'},'guest_path':{'type':'string'},'executable':{'type':'boolean','default':False}},'required':['local_path','guest_path'],'additionalProperties':False}},
+ {'name':'exec','description':'Execute argv in this leased guest without implicit shell expansion. Output capped at 64KiB per stream.', 'inputSchema':{'type':'object','properties':{'argv':{'type':'array','items':{'type':'string'},'minItems':1},'timeout_sec':{'type':'integer','minimum':1,'maximum':300,'default':60}},'required':['argv'],'additionalProperties':False}}
+]
+TOOLS.extend([
+ {'name':'screenshot','description':'Capture this Android guest screen as a PNG image.','inputSchema':{'type':'object','properties':{},'additionalProperties':False}},
+ {'name':'tap','description':'Tap screen coordinates in pixels.','inputSchema':{'type':'object','properties':{'x':{'type':'integer','minimum':0},'y':{'type':'integer','minimum':0}},'required':['x','y'],'additionalProperties':False}},
+ {'name':'keyevent','description':'Send an Android key code, for example KEYCODE_HOME or KEYCODE_BACK.','inputSchema':{'type':'object','properties':{'key':{'type':'string'}},'required':['key'],'additionalProperties':False}},
+ {'name':'ui_hierarchy','description':'Read the full Android UI layout as JSON using Android CLI.','inputSchema':{'type':'object','properties':{},'additionalProperties':False}}
+])
+for name in ('install_app','run_app'):
+ TOOLS.append({'name':name,'description':('Install APKs' if name=='install_app' else 'Install APKs and launch their app')+' in this leased emulator using Android CLI. APK paths are absolute host paths.','inputSchema':{'type':'object','properties':{'apks':{'type':'array','items':{'type':'string'},'minItems':1},**({'activity':{'type':'string','description':'Fully qualified activity class, e.g. com.android.settings.Settings; omit to use the default launcher activity.'}} if name=='run_app' else {})},'required':['apks'],'additionalProperties':False}})
+
+def ui_tool(name,description,properties,required=()):
+ TOOLS.append({'name':name,'description':description,'inputSchema':{'type':'object','properties':properties,'required':list(required),'additionalProperties':False}})
+
+COORD={'type':'integer','minimum':0}
+DURATION={'type':'integer','minimum':1,'maximum':10000,'default':500}
+SELECTOR={'type':'object','properties':{k:{'type':'string','minLength':1} for k in ('text','resource_id','description','class_name')},'minProperties':1,'additionalProperties':False,'description':'Exact, case-sensitive matches; all supplied fields must match. Only visible elements are returned.'}
+for name,description in [('swipe','Move one finger between pixel coordinates.'),('drag_and_drop','Long-press the start position, then drag and release at the end. Uses Android draganddrop, not an ordinary swipe.')]:
+ ui_tool(name,description,{**{k:COORD for k in ('x1','y1','x2','y2')},'duration_ms':DURATION},('x1','y1','x2','y2'))
+ui_tool('long_press','Hold one screen position, then release.',{'x':COORD,'y':COORD,'duration_ms':{**DURATION,'default':1000}},('x','y'))
+ui_tool('scroll','Scroll content toward a direction (down reveals content below). Optional bounds restrict the gesture to a scroll container.',{'direction':{'enum':['up','down','left','right']},'bounds':{'type':'array','items':COORD,'minItems':4,'maxItems':4,'description':'[left, top, right, bottom] in current screen pixels'},'duration_ms':DURATION},('direction',))
+ui_tool('type_text','Type printable ASCII into the focused field. Unicode is rejected; use exec or an app-specific input method for other characters. Optional clear selects all and deletes first.',{'text':{'type':'string','maxLength':4096},'clear':{'type':'boolean','default':False}},('text',))
+ui_tool('keyboard','Clear the focused field, submit with Enter, or hide the visible keyboard.',{'action':{'enum':['clear','submit','hide']}},('action',))
+ui_tool('find_elements','Find visible elements by exact matching fields using Android CLI layout.',{'selector':SELECTOR},('selector',))
+ui_tool('tap_element','Tap a matching element center. Ambiguous matches fail unless a zero-based index is supplied.',{'selector':SELECTOR,'index':{'type':'integer','minimum':0}},('selector',))
+ui_tool('wait_for_element','Wait for a matching visible element or for all matching elements to disappear. A timeout is an error; observation failures are never treated as absence.',{'selector':SELECTOR,'state':{'enum':['visible','absent'],'default':'visible'},'timeout_sec':{'type':'integer','minimum':1,'maximum':120,'default':30}},('selector',))
+ui_tool('rotate','Set user rotation or restore automatic rotation. Apps may enforce their own orientation.',{'orientation':{'enum':['portrait','landscape','reverse_portrait','reverse_landscape','auto']}},('orientation',))
+ui_tool('app_lifecycle','Background the current app with Home; resume an installed app without force-stopping; stop or relaunch a package. Relaunch force-stops then starts its launcher activity.',{'action':{'enum':['background','resume','stop','relaunch']},'package':{'type':'string'}},('action',))
+ui_tool('start_recording','Start a silent MP4 recording while subsequent MCP interactions run. Stop/export before disconnect; one recording per lease. Keep orientation unchanged while recording.',{'max_duration_sec':{'type':'integer','minimum':1,'maximum':180,'default':180}})
+ui_tool('stop_recording','Finalize recording and export MP4 to the MCP host. Returns absolute host path, byte count and SHA256. Optional destination must not exist.',{'local_path':{'type':'string'}})
+UI_TOOLS={t['name'] for t in TOOLS}-{'upload','exec','screenshot','tap','keyevent','ui_hierarchy','install_app','run_app'}
+
+
+def log(s):
+ print(s, file=sys.stderr, flush=True)
+
+def config():
+ c=json.loads(CONFIG.read_text())
+ c['sdk']=str(Path(c.get('sdk',Path.home()/'Android/Sdk')).expanduser().resolve())
+ c['base']=str(Path(c['base']).expanduser().resolve())
+ for k,d,lo,hi in [('capacity',4,1,4),('memory_mb',4096,2048,65536),('cpus',2,1,64),('port_start',5570,5554,5584),('startup_timeout_sec',280,10,3600),('min_free_gb',10,1,10000)]:
+  c.setdefault(k,d)
+  if type(c[k]) is not int or not lo<=c[k]<=hi: raise ValueError('invalid config '+k)
+ if c['port_start']%2 or c['port_start']+2*(c['capacity']-1)>5584: raise ValueError('emulator console ports must be even and within 5554..5584')
+ c['idle_sec']=IDLE_SEC
+ c.setdefault('auto_view',True)
+ if type(c['auto_view']) is not bool: raise ValueError('auto_view must be boolean')
+ c.setdefault('audio_input',False)
+ if type(c['audio_input']) is not bool: raise ValueError('audio_input must be boolean')
+ return c
+
+def setup():
+ os.umask(0o077)
+ STATE.mkdir(parents=True,exist_ok=True,mode=0o700)
+ if STATE.stat().st_uid != os.getuid() or STATE.stat().st_mode & 0o077: raise RuntimeError('state directory must be owned by current user and mode 0700')
+ # Short socket path, unique to this state directory; enclosing dir private.
+ runtime=Path('/tmp')/('android-dispenser-'+str(os.getuid())+'-'+hashlib.sha256(str(STATE).encode()).hexdigest()[:16])
+ runtime.mkdir(mode=0o700,exist_ok=True)
+ if runtime.is_symlink() or runtime.stat().st_uid != os.getuid() or runtime.stat().st_mode & 0o077: raise RuntimeError('unsafe runtime directory')
+ return runtime
+
+def send(sock,obj): sock.sendall((json.dumps(obj)+'\n').encode())
+def receive(sock):
+ data=bytearray()
+ while not data.endswith(b'\n'):
+  b=sock.recv(1)
+  if not b: raise ConnectionError('dispenser connection closed')
+  data.extend(b)
+  if len(data)>65536: raise ValueError('dispenser message too large')
+ return json.loads(data)
+
+def qmp(path,command,args=None,timeout=10):
+ with socket.socket(socket.AF_UNIX) as s:
+  s.settimeout(timeout); s.connect(str(path)); receive(s)
+  send(s,{'execute':'qmp_capabilities'})
+  while 'return' not in receive(s): pass
+  send(s,{'execute':command,'arguments':args or {}})
+  while True:
+   r=receive(s)
+   if 'error' in r: raise RuntimeError(str(r['error']))
+   if 'return' in r: return r['return']
+
+def adb(c,port):
+ return [str(Path(c['sdk'])/'platform-tools/adb'),'-s','emulator-'+str(port),'shell','-T']
+
+def android(c,port,*command):
+ return [c.get('android_cli','/usr/local/bin/android'),'--sdk='+c['sdk'],*command,'--device=emulator-'+str(port)]
+
+def cli_result(command,timeout,cancel):
+ result=bounded(command,timeout,cancel=cancel)
+ # Android CLI can print an error while returning exit status zero.
+ if result['exit_code']==0 and re.search(r'(?im)^\s*(?:error:|component check failed)',result['stderr']+'\n'+result['stdout']): result['exit_code']=1
+ return result
+
+def cli_app(c,port,name,args,cancel):
+ apks=args.get('apks')
+ if not isinstance(apks,list) or not apks or not all(isinstance(p,str) and os.path.isabs(p) and ',' not in p and '\0' not in p and Path(p).is_file() for p in apks): raise ValueError('apks must be existing absolute host file paths without commas')
+ command=android(c,port,'install' if name=='install_app' else 'run')+['--apks='+','.join(apks)]
+ if 'activity' in args:
+  if name!='run_app' or not isinstance(args['activity'],str) or not args['activity'] or '\0' in args['activity']: raise ValueError('invalid activity')
+  command.append('--activity='+args['activity'])
+ return cli_result(command,300,cancel)
+
+def screenshot(c,port,cancel):
+ with tempfile.TemporaryDirectory(prefix='android-screen-',dir=STATE) as folder:
+  path=Path(folder)/'screen.png'
+  result=cli_result(android(c,port,'screen','capture')+['--output='+str(path)],60,cancel)
+  if result['exit_code'] or result['timed_out']: raise RuntimeError('screenshot failed: '+result['stderr']+result['stdout'])
+  with path.open('rb') as src: data=src.read(16*1024*1024+1)
+  if len(data)>16*1024*1024 or not data.startswith(b'\x89PNG\r\n\x1a\n'): raise RuntimeError('invalid or oversized screenshot')
+  return {'content':[{'type':'image','mimeType':'image/png','data':base64.b64encode(data).decode()}]}
+
+def layout(c,port,cancel,timeout=60,flat=False,idle=False):
+ with tempfile.TemporaryDirectory(prefix='android-layout-',dir=STATE) as folder:
+  path=Path(folder)/'layout.json'
+  result=cli_result(android(c,port,'layout')+['--full','--output='+str(path)]+(['--flat'] if flat else [])+(['--no-idle'] if flat and not idle else []),timeout,cancel)
+  if result['exit_code'] or result['timed_out']: return result
+  with path.open('rb') as src: data=src.read(1024*1024+1)
+  if len(data)>1024*1024: raise RuntimeError('layout exceeds 1 MiB')
+  result['stdout']=json.dumps(json.loads(data),separators=(',',':'))
+  result['truncated']=False
+  return result
+
+def integer(args,key,default=None,lo=0,hi=100000):
+ value=args.get(key,default)
+ if type(value) is not int or not lo<=value<=hi: raise ValueError(f'{key} must be an integer from {lo} to {hi}')
+ return value
+
+class InteractionSession:
+ def __init__(self,c,port,cancel):
+  self.c=c; self.port=port; self.cancel=cancel; self.recording=None
+ def __enter__(self): return self
+ def __exit__(self,*_):
+  if self.recording:
+   with contextlib.suppress(Exception): self.finish_recording(discard=True)
+ def run(self,argv,timeout=30):
+  result=execute(self.c,self.port,{'argv':argv,'timeout_sec':timeout},self.cancel)
+  if result['exit_code'] or result['timed_out']: raise RuntimeError(json.dumps(result))
+  return result
+ def elements(self,selector,timeout=60):
+  fields={'text':'text','resource_id':'resource-id','description':'content-desc','class_name':'class'}
+  if not isinstance(selector,dict) or not selector or any(k not in fields or not isinstance(v,str) or not v for k,v in selector.items()): raise ValueError('invalid selector')
+  result=layout(self.c,self.port,self.cancel,timeout=timeout,flat=True)
+  if result['exit_code'] or result['timed_out'] or result['truncated']: raise RuntimeError('layout failed: '+json.dumps(result))
+  nodes=json.loads(result['stdout'])
+  if not isinstance(nodes,list): raise RuntimeError('Android CLI returned an unexpected flat layout')
+  matches=[]
+  for node in nodes:
+   if not isinstance(node,dict) or node.get('hidden') or node.get('off-screen'): continue
+   if not all(node.get(fields[k])==v for k,v in selector.items()): continue
+   b=re.fullmatch(r'\[(-?\d+),(-?\d+)\]\[(-?\d+),(-?\d+)\]',node.get('bounds',''))
+   if not b: continue
+   left,top,right,bottom=map(int,b.groups())
+   if right<=max(0,left) or bottom<=max(0,top): continue
+   matches.append({**node,'center_x':(max(0,left)+right)//2,'center_y':(max(0,top)+bottom)//2})
+  return matches
+ def focused_editor(self):
+  result=layout(self.c,self.port,self.cancel,timeout=15,flat=True,idle=True)
+  if result['exit_code'] or result['timed_out']: raise RuntimeError('cannot inspect focused editor: '+json.dumps(result))
+  nodes=json.loads(result['stdout'])
+  if not isinstance(nodes,list) or not any(isinstance(n,dict) and 'FOCUSED' in n.get('state',[]) and 'EDITABLE' in n.get('interactions',[]) and not n.get('hidden') for n in nodes): raise ValueError('focus an editable text field before typing or clearing')
+ def clear(self,checked=False):
+  if not checked: self.focused_editor()
+  self.run(['input','keycombination','KEYCODE_CTRL_LEFT','KEYCODE_A'])
+  return self.run(['input','keyevent','KEYCODE_DEL'])
+ def finish_recording(self,path=None,discard=False):
+  if not self.recording: raise ValueError('no recording started in this lease')
+  pid,guest=self.recording
+  if not discard:
+   if path is not None and (not isinstance(path,str) or not os.path.isabs(path) or '\0' in path): raise ValueError('local_path must be absolute')
+   dest=Path(path) if path else STATE/'recordings'/(Path(guest).name)
+   if not path: dest.parent.mkdir(mode=0o700,exist_ok=True)
+   if dest.exists() or dest.is_symlink(): raise ValueError('recording destination already exists')
+   if not dest.parent.is_dir(): raise ValueError('recording destination parent must exist')
+  # SIGINT makes screenrecord finalize the MP4. Wait for exit (including zombies).
+  script=f'kill -INT {pid} 2>/dev/null; for i in $(seq 1 50); do if ! kill -0 {pid} 2>/dev/null || grep -q "State:.*Z" /proc/{pid}/status 2>/dev/null; then exit 0; fi; sleep 0.1; done; exit 1'
+  result=bounded(adb(self.c,self.port)+[shlex.join(['sh','-c',script])],10)
+  if not discard and result['exit_code']: raise RuntimeError('recording did not finalize; retry stop_recording')
+  if not discard:
+   with tempfile.TemporaryDirectory(prefix='.android-recording-',dir=dest.parent) as folder:
+    temp=Path(folder)/'capture.mp4'
+    result=bounded(adb(self.c,self.port)[:-2]+['pull',guest,str(temp)],60,cancel=self.cancel)
+    if result['exit_code'] or result['timed_out']: raise RuntimeError('recording export failed: '+json.dumps(result))
+    with temp.open('rb') as src:
+     if src.read(12)[4:8]!=b'ftyp': raise RuntimeError('recording is empty or invalid; retry after allowing capture to start')
+     src.seek(0); digest=hashlib.sha256()
+     for block in iter(lambda:src.read(1024*1024),b''): digest.update(block)
+     digest=digest.hexdigest()
+    temp.chmod(0o600); os.link(temp,dest)
+   output={'local_path':str(dest),'bytes':dest.stat().st_size,'sha256':digest}
+  bounded(adb(self.c,self.port)+[shlex.join(['rm','-f',guest,guest+'.log'])],10)
+  self.recording=None
+  return {} if discard else output
+ def call(self,name,args):
+  if self.cancel.is_set(): raise RuntimeError('client disconnected')
+  if name in ('swipe','drag_and_drop','long_press','scroll'):
+   duration=integer(args,'duration_ms',1000 if name=='long_press' else 500,1,10000)
+   if name=='long_press':
+    x=integer(args,'x'); y=integer(args,'y'); coords=[x,y,x,y]
+   elif name=='scroll':
+    direction=args.get('direction')
+    if direction not in ('up','down','left','right'): raise ValueError('invalid scroll direction')
+    bounds=args.get('bounds')
+    if bounds is None:
+     result=self.run(['dumpsys','input'])
+     match=re.search(r'Viewport[^\n]*displayId=0,[^\n]*logicalFrame=\[0, 0, ([1-9]\d*), ([1-9]\d*)\][^\n]*isActive=\[1\]',result['stdout'])
+     if not match: raise RuntimeError('cannot determine current display bounds; supply bounds')
+     bounds=[0,0,*map(int,match.groups())]
+    if not isinstance(bounds,list) or len(bounds)!=4 or any(type(v) is not int or v<0 for v in bounds): raise ValueError('bounds must contain four nonnegative integers')
+    l,t,r,b=bounds
+    if r-l<10 or b-t<10: raise ValueError('bounds must have positive width and height of at least 10 pixels')
+    x=(l+r)//2; y=(t+b)//2; dx=(r-l)//4; dy=(b-t)//4
+    coords={'down':[x,y+dy,x,y-dy],'up':[x,y-dy,x,y+dy],'right':[x+dx,y,x-dx,y],'left':[x-dx,y,x+dx,y]}[direction]
+   else: coords=[integer(args,k) for k in ('x1','y1','x2','y2')]
+   return self.run(['input','touchscreen','draganddrop' if name=='drag_and_drop' else 'swipe',*map(str,coords),str(duration)])
+  if name=='type_text':
+   value=args.get('text'); clear=args.get('clear',False)
+   if not isinstance(value,str) or len(value)>4096 or any(ord(ch)<32 or ord(ch)>126 for ch in value): raise ValueError('text must be printable ASCII, at most 4096 characters')
+   if type(clear) is not bool: raise ValueError('clear must be boolean')
+   self.focused_editor()
+   if clear: self.clear(checked=True)
+   # Separate percent characters so Android never interprets a literal %s as space.
+   for chunk in re.split('(%)',value):
+    if chunk: self.run(['input','text',chunk.replace(' ','%s')])
+   return {'typed_characters':len(value),'cleared':clear}
+  if name=='keyboard':
+   action=args.get('action')
+   if action=='clear': return self.clear()
+   if action=='submit': return self.run(['input','keyevent','KEYCODE_ENTER'])
+   if action=='hide':
+    status=self.run(['dumpsys','input_method'])['stdout']
+    if re.search(r'mInputShown=true|isInputViewShown=true',status): return self.run(['input','keyevent','KEYCODE_BACK'])
+    return {'hidden':True,'already_hidden':True}
+   raise ValueError('invalid keyboard action')
+  if name in ('find_elements','tap_element','wait_for_element'):
+   selector=args.get('selector')
+   if name=='wait_for_element':
+    state=args.get('state','visible'); timeout=integer(args,'timeout_sec',30,1,120)
+    if state not in ('visible','absent'): raise ValueError('invalid wait state')
+    start=time.monotonic(); deadline=start+timeout
+    while True:
+     remaining=deadline-time.monotonic()
+     if remaining<=0: raise TimeoutError(f'element did not become {state} within {timeout} seconds')
+     matches=self.elements(selector,timeout=remaining)
+     if bool(matches)==(state=='visible'): return {'state':state,'elements':matches,'elapsed_sec':round(time.monotonic()-start,3)}
+     if self.cancel.wait(min(.3,max(0,deadline-time.monotonic()))): raise RuntimeError('client disconnected')
+   matches=self.elements(selector)
+   if name=='find_elements': return {'elements':matches,'count':len(matches)}
+   index=integer(args,'index',0)
+   if len(matches)>1 and 'index' not in args: raise ValueError(f'{len(matches)} elements matched; refine selector or supply index')
+   if index>=len(matches): raise ValueError('no element at the requested index')
+   node=matches[index]; self.run(['input','tap',str(node['center_x']),str(node['center_y'])]); return {'element':node}
+  if name=='rotate':
+   orientation=args.get('orientation'); modes={'portrait':0,'landscape':1,'reverse_portrait':2,'reverse_landscape':3}
+   if orientation!='auto' and orientation not in modes: raise ValueError('invalid orientation')
+   if self.recording: raise ValueError('stop recording before rotating')
+   return self.run(['wm','user-rotation',*(['free'] if orientation=='auto' else ['lock',str(modes[orientation])])])
+  if name=='app_lifecycle':
+   action=args.get('action')
+   if action not in ('background','resume','stop','relaunch'): raise ValueError('invalid lifecycle action')
+   if action=='background': return self.run(['input','keyevent','KEYCODE_HOME'])
+   package=args.get('package')
+   if not isinstance(package,str) or not re.fullmatch(r'[A-Za-z][A-Za-z0-9_]*(?:\.[A-Za-z0-9_]+)+',package): raise ValueError('valid package required')
+   exists=self.run(['pm','path',package])
+   if not exists['stdout'].startswith('package:'): raise ValueError('package is not installed')
+   if action=='stop': return self.run(['am','force-stop',package])
+   result=self.run(['cmd','package','resolve-activity','--brief','-a','android.intent.action.MAIN','-c','android.intent.category.LAUNCHER',package])
+   component=result['stdout'].strip().splitlines()[-1]
+   if not re.fullmatch(r'[A-Za-z0-9_.$]+/[A-Za-z0-9_.$]+',component): raise RuntimeError('no launcher activity found')
+   if action=='relaunch': self.run(['am','force-stop',package])
+   result=self.run(['am','start','-W','-a','android.intent.action.MAIN','-c','android.intent.category.LAUNCHER','-n',component])
+   if re.search(r'(?im)^Error',result['stdout']+result['stderr']): raise RuntimeError(json.dumps(result))
+   return result
+  if name=='start_recording':
+   if self.recording: raise ValueError('a recording already exists; stop/export it first')
+   duration=integer(args,'max_duration_sec',180,1,180)
+   guest='/data/local/tmp/dispenser-recording-'+uuid.uuid4().hex+'.mp4'
+   script=shlex.join(['nohup','screenrecord','--time-limit',str(duration),guest])+' </dev/null >'+shlex.quote(guest+'.log')+' 2>&1 & echo $!'
+   result=self.run(['sh','-c',script]); pid=result['stdout'].strip()
+   if not pid.isdigit(): raise RuntimeError('screenrecord did not return a process id')
+   self.recording=(int(pid),guest)
+   self.run(['sh','-c',f'sleep 0.3; kill -0 {pid}'])
+   return {'recording':True,'max_duration_sec':duration,'guest_path':guest}
+  if name=='stop_recording': return self.finish_recording(args.get('local_path'))
+  raise ValueError('unknown interaction tool')
+
+def alive(r):
+ try:
+  raw=Path('/proc/'+str(r['pid'])+'/cmdline').read_bytes().split(b'\0')
+  return str(Path(r['disk']).parent).encode() in raw and (r['id'].encode() in raw or ('android-dispenser-'+r['id']).encode() in raw)
+ except (KeyError,OSError): return False
+
+def atomic(path,obj):
+ tmp=path.with_suffix('.tmp'); tmp.write_text(json.dumps(obj,indent=2)+'\n'); tmp.replace(path)
+
+def base_api_level(c):
+ def properties(path):
+  values={}
+  for line in path.read_text().splitlines():
+   key,sep,value=line.partition('=')
+   if sep and not key.lstrip().startswith(('#','!')): values[key.strip()]=value.strip()
+  return values
+ template=Path(c['base'])/'config.ini'
+ try:
+  image=properties(template).get('image.sysdir.1')
+  if not image: raise ValueError('image.sysdir.1 is missing')
+  folder=Path(image)
+  if not folder.is_absolute(): folder=Path(c['sdk'])/folder
+  level=properties(folder/'source.properties').get('AndroidVersion.ApiLevel','')
+  if not level.isdecimal() or int(level)<1: raise ValueError('AndroidVersion.ApiLevel must be a positive integer')
+  return int(level)
+ except (OSError,ValueError) as e:
+  raise RuntimeError('Cannot read Android version for base '+str(template)+': '+str(e)) from e
+
+class Dispenser:
+ def __init__(self,c,runtime):
+  self.c=c; self.runtime=runtime; self.lock=threading.RLock(); self.records={}; self.leases={}; self.activity={}; self.busy=set(); self.stopping=False; self.idle_timer=None; self.disconnected={}
+  (STATE/'instances').mkdir(exist_ok=True)
+  self.api_level=base_api_level(c)
+  self.processes={}
+  # Records exist only to identify and clean up owned processes after a crash.
+  # Old retained disks and orphaned guests are never resumed.
+  for folder in (STATE/'instances').iterdir():
+   if not folder.is_dir() or len(folder.name)!=32 or any(ch not in '0123456789abcdef' for ch in folder.name): continue
+   r={'id':folder.name,'disk':str(folder/'userdata-qemu.img'),'qmp':str(runtime/(folder.name[:12]+'.qmp'))}
+   record=folder/'record.json'
+   if record.exists():
+    saved=json.loads(record.read_text())
+    if 'pid' in saved: r['pid']=saved['pid']
+   self.records[r['id']]=r
+   self.destroy(r)
+ def update_idle_timer(self):
+  if self.idle_timer is not None:
+   self.idle_timer.cancel(); self.idle_timer=None
+  if self.leases or self.stopping: return
+  def expire():
+   with self.lock:
+    if self.idle_timer is timer and not self.leases:
+     self.stopping=True
+  timer=threading.Timer(IDLE_SEC,expire)
+  timer.daemon=True; self.idle_timer=timer; timer.start()
+ def release(self,key):
+  if self.leases.pop(key,None) is not None: self.update_idle_timer()
+ def cancel_deletion(self,key):
+  pending=self.disconnected.pop(key,None)
+  if pending is not None: pending[1].cancel()
+ def disconnect(self,key):
+  self.release(key)
+  self.busy.discard(key)
+  self.cancel_deletion(key)
+  def expire():
+   with self.lock:
+    if self.disconnected.get(key) is pending and key not in self.leases:
+     try: self.destroy(self.records[key])
+     except Exception as e: log('disconnect cleanup '+key+': '+str(e))
+  timer=threading.Timer(DISCONNECT_GRACE_SEC,expire)
+  pending=(time.monotonic()+DISCONNECT_GRACE_SEC,timer)
+  self.disconnected[key]=pending
+  timer.daemon=True; timer.start()
+ def save(self,r): atomic(Path(r['disk']).parent/'record.json',r)
+ def stop(self,r):
+  pidfile=Path(r['disk']).parent/'qemu.pid'
+  if pidfile.exists():
+   candidate=dict(r,pid=int(pidfile.read_text()))
+   if alive(candidate): r['pid']=candidate['pid']
+  if alive(r):
+   try: qmp(r['qmp'],'quit')
+   except (OSError,RuntimeError,ConnectionError): pass
+   deadline=time.monotonic()+5
+   while alive(r) and time.monotonic()<deadline: time.sleep(.1)
+   if alive(r): os.kill(r['pid'],signal.SIGTERM)
+   deadline=time.monotonic()+3
+   while alive(r) and time.monotonic()<deadline: time.sleep(.1)
+   if alive(r): raise RuntimeError('owned VM did not stop; refusing slot reuse')
+  proc=self.processes.pop(r['id'],None)
+  if proc is not None:
+   try: proc.wait(timeout=3)
+   except subprocess.TimeoutExpired:
+    proc.terminate()
+    try: proc.wait(timeout=3)
+    except subprocess.TimeoutExpired: proc.kill(); proc.wait()
+  r.pop('pid',None)
+ def destroy(self,r):
+  r['deleting']=True
+  key=r['id']
+  self.cancel_deletion(key)
+  conn=self.leases.get(key)
+  if conn is not None:
+   with contextlib.suppress(OSError): conn.shutdown(socket.SHUT_RDWR)
+  self.stop(r)
+  # Serialize viewer teardown against manual/automatic viewer creation.
+  lockpath=self.runtime/(key+'.view.lock')
+  with open(lockpath,'a') as lock:
+   fcntl.flock(lock,fcntl.LOCK_EX)
+   marker=self.runtime/(key+'.viewer.json')
+   try:
+    saved=json.loads(marker.read_text())
+    command=Path('/proc/'+str(saved['pid'])+'/cmdline').read_bytes().split(b'\0')
+    if saved['url'].encode() in command and ('Android '+key[:12]).encode() in command and any(Path(os.fsdecode(part)).name=='scrcpy' for part in command if part):
+     os.kill(saved['pid'],signal.SIGTERM)
+   except (OSError,ValueError,KeyError): pass
+   marker.unlink(missing_ok=True)
+   marker.with_suffix('.tmp').unlink(missing_ok=True)
+   Path(r['qmp']).unlink(missing_ok=True)
+   shutil.rmtree(Path(r['disk']).parent)
+   (self.runtime/(key+'.ini')).unlink(missing_ok=True)
+  lockpath.unlink(missing_ok=True)
+  self.records.pop(key,None); self.release(key)
+  self.activity.pop(key,None); self.busy.discard(key)
+ def touch(self,key,busy=False):
+  self.activity[key]=time.monotonic()
+  self.records[key]['last_activity']=time.time()
+  if busy: self.busy.add(key)
+  else: self.busy.discard(key)
+ def collect(self):
+  with self.lock:
+   low_space=shutil.disk_usage(STATE).free < self.c['min_free_gb']*1024**3
+   for key,r in list(self.records.items()):
+    pending=self.disconnected.get(key)
+    expired=(time.monotonic()>=pending[0] if pending is not None else
+             key not in self.busy and time.monotonic()-self.activity.get(key,0)>=IDLE_SEC)
+    if low_space or r.get('deleting') or not alive(r) or expired:
+     try: self.destroy(r)
+     except Exception as e: log('cleanup '+key+': '+str(e))
+ def acquire(self,instance,conn):
+  if not isinstance(instance,str) or len(instance)!=64 or any(ch not in '0123456789abcdef' for ch in instance): raise ValueError('owner token must be 64 lowercase hexadecimal characters')
+  key=hashlib.sha256(instance.encode()).hexdigest()[:32]
+  with self.lock:
+   if self.stopping: raise RuntimeError('dispenser is shutting down')
+   self.collect()
+   if key in self.leases: raise RuntimeError('instance already leased; close its existing MCP connection first')
+   if shutil.disk_usage(STATE).free < self.c['min_free_gb']*1024**3: raise RuntimeError('insufficient free disk space')
+   r=self.records.get(key)
+   if r is not None and (r.get('deleting') or not alive(r)): raise RuntimeError('instance cleanup pending; cannot reuse its disk')
+   if (r is None or not alive(r)) and sum(alive(x) or k in self.leases for k,x in self.records.items())>=self.c['capacity']:
+    raise RuntimeError('running VM capacity reached')
+   if r is None:
+    slot=None
+    folder=STATE/'instances'/key; folder.mkdir(mode=0o700)
+    disk=folder/'userdata-qemu.img'
+    try: shutil.copyfile(Path(self.c['base'])/'config.ini',folder/'config.ini')
+    except Exception: shutil.rmtree(folder); raise
+    r={'id':key,'slot':slot,'disk':str(disk),'qmp':str(self.runtime/(key[:12]+'.qmp')),'last_activity':time.time()}
+    self.records[key]=r
+   self.cancel_deletion(key)
+   self.leases[key]=conn; self.update_idle_timer(); self.touch(key,busy=True)
+   try:
+    if not alive(r): self.start(r)
+   except Exception:
+    self.busy.discard(key)
+    self.destroy(r); raise
+   return key,r
+ def start(self,r):
+  c=self.c; folder=Path(r['disk']).parent
+  avd_config=folder/'config.ini'
+  lines=[line for line in avd_config.read_text().splitlines() if not re.match(r'\s*target\s*=',line)]
+  avd_config.write_text('\n'.join(lines+[f'target=android-{self.api_level}'])+'\n')
+  if c['audio_input']:
+   avd_config=folder/'config.ini'
+   lines=[line for line in avd_config.read_text().splitlines() if not re.match(r'\s*hw\.audioInput\s*=',line)]
+   avd_config.write_text('\n'.join(lines+['hw.audioInput=yes'])+'\n')
+  used={x['slot'] for x in self.records.values() if x['id']!=r['id'] and (alive(x) or x['id'] in self.leases)}
+  available=[i for i in range(c['capacity']) if i not in used]
+  if not available: raise RuntimeError('running VM capacity reached; wait for an idle VM to expire')
+  r['slot']=available[0]; self.save(r); port=c['port_start']+2*r['slot']
+  # QEMU itself binds port atomically; collision fails allocation, never chooses a live user's endpoint.
+  Path(r['qmp']).unlink(missing_ok=True)
+  pidfile=folder/'qemu.pid'; pidfile.unlink(missing_ok=True)
+  (self.runtime/(r['id']+'.ini')).write_text('avd.ini.encoding=UTF-8\npath='+str(folder)+f'\ntarget=android-{self.api_level}\n')
+  cmd=[str(Path(c['sdk'])/'emulator/emulator'),'-avd',r['id'],'-datadir',str(folder),'-port',str(port),'-no-window','-no-snapshot','-no-audio','-no-boot-anim','-gpu','swiftshader','-memory',str(c['memory_mb']),'-cores',str(c['cpus']),'-qemu','-name','android-dispenser-'+r['id'],'-qmp','unix:'+r['qmp']+',server=on,wait=off','-pidfile',str(pidfile)]
+  if c['audio_input']: cmd.remove('-no-audio')
+  env=dict(os.environ,ANDROID_AVD_HOME=str(self.runtime),ANDROID_HOME=c['sdk'],ANDROID_SDK_ROOT=c['sdk'])
+  with open(folder/'qemu.log','ab') as out:
+   proc=subprocess.Popen(cmd,stdin=subprocess.DEVNULL,stdout=out,stderr=out,start_new_session=True,env=env)
+  self.processes[r['id']]=proc
+  r['pid']=proc.pid; self.save(r)
+  deadline=time.monotonic()+20
+  while not pidfile.exists():
+   if proc.poll() is not None: raise RuntimeError('emulator exited; inspect '+str(folder/'qemu.log'))
+   if time.monotonic()>deadline: raise TimeoutError('emulator startup timed out')
+   time.sleep(.1)
+  r['pid']=int(pidfile.read_text()); self.save(r)
+ def ready(self,r,conn):
+  deadline=time.monotonic()+self.c['startup_timeout_sec']
+  port=self.c['port_start']+2*r['slot']
+  command='getprop sys.boot_completed; getprop ro.build.version.sdk'
+  host=[str(Path(self.c['sdk'])/'platform-tools/adb'),'-s','emulator-'+str(port)]
+  pending='ADB/Android readiness'
+  while time.monotonic()<deadline:
+   if self.stopping: raise RuntimeError('dispenser shutting down')
+   readable,_,_=__import__('select').select([conn],[],[],0)
+   if readable and not conn.recv(1,socket.MSG_PEEK): raise ConnectionError('client disconnected during startup')
+   if not alive(r):
+    log((Path(r['disk']).parent/'qemu.log').read_text(errors='replace')[-6000:])
+    raise RuntimeError('VM exited; inspect '+str(STATE/'dispenser.log'))
+   try:
+    boot=subprocess.run(adb(self.c,port)+[command],stdin=subprocess.DEVNULL,stdout=subprocess.PIPE,stderr=subprocess.DEVNULL,timeout=7)
+    values=boot.stdout.decode().split()
+    if boot.returncode==0 and values and values[0]=='1':
+     if values!=['1',str(self.api_level)]: raise RuntimeError(f'guest Android API does not match base image API {self.api_level}: '+str(values[1:]))
+     subprocess.run(host+['root'],stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,timeout=15,check=True)
+     subprocess.run(host+['wait-for-device'],stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,timeout=30,check=True)
+     uid=subprocess.run(adb(self.c,port)+['id -u'],stdin=subprocess.DEVNULL,stdout=subprocess.PIPE,stderr=subprocess.DEVNULL,timeout=7)
+     if uid.returncode!=0 or uid.stdout.decode().strip()!='0':
+      # adbd restarts after "adb root"; retry until it answers as root.
+      pending='ADB root'; time.sleep(1); continue
+     subprocess.run(adb(self.c,port)+['settings put secure stylus_handwriting_enabled 0'],
+                    stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,timeout=7,check=True)
+     if alive(r): return
+   except subprocess.TimeoutExpired: pass
+   time.sleep(1)
+  raise TimeoutError(pending+' timed out')
+ def handle(self,conn):
+  key=None
+  try:
+   req=receive(conn); op=req.get('op')
+   if op=='acquire':
+    key,r=self.acquire(req.get('instance'),conn); self.ready(r,conn)
+    with self.lock:
+     if self.leases.get(key) is not conn: raise ConnectionError('VM lease expired')
+     self.touch(key)
+     send(conn,{'ok':True,'port':self.c['port_start']+2*r['slot'],'id':key,'auto_view':self.c['auto_view']})
+    while True:
+     events=conn.recv(4096)
+     if not events: break
+     with self.lock:
+      if self.leases.get(key) is not conn: break
+      for event in events:
+       if event not in (ord('B'),ord('I')): raise ValueError('invalid activity event')
+       self.touch(key,busy=event==ord('B'))
+   elif op=='status':
+    with self.lock: send(conn,{'ok':True,'config':{k:self.c[k] for k in ('capacity','cpus','memory_mb','idle_sec','auto_view')},'instances':[dict(id=k,running=alive(r),leased=k in self.leases,port=(self.c['port_start']+2*r['slot'] if alive(r) else None),last_activity=r['last_activity'],busy=k in self.busy) for k,r in self.records.items()]})
+   elif op=='shutdown':
+    with self.lock:
+     if self.leases: raise RuntimeError('cannot shut down while instances are leased')
+     self.stopping=True; send(conn,{'ok':True})
+   else: raise ValueError('unknown operation')
+  except Exception as e:
+   with contextlib.suppress(OSError): send(conn,{'ok':False,'error':str(e)})
+  finally:
+   if key:
+    with self.lock:
+     if self.leases.get(key) is conn:
+      self.disconnect(key)
+   conn.close()
+ def serve(self):
+  path=self.runtime/'dispenser.sock'; path.unlink(missing_ok=True)
+  with socket.socket(socket.AF_UNIX) as server:
+   server.bind(str(path)); server.listen(32); server.settimeout(1)
+   def stop_signal(*_): self.stopping=True
+   signal.signal(signal.SIGTERM,stop_signal); signal.signal(signal.SIGINT,stop_signal)
+   with self.lock: self.update_idle_timer()
+   last=0
+   while not self.stopping:
+    try: conn,_=server.accept(); threading.Thread(target=self.handle,args=(conn,),daemon=True).start()
+    except socket.timeout: pass
+    if time.monotonic()-last>2:
+     try: self.collect()
+     except Exception as e: log('cleanup: '+str(e))
+     last=time.monotonic()
+   with self.lock:
+    self.update_idle_timer()
+    for conn in self.leases.values():
+     with contextlib.suppress(OSError): conn.shutdown(socket.SHUT_RDWR)
+    for r in list(self.records.values()):
+     try: self.destroy(r)
+     except Exception as e: log('shutdown cleanup: '+str(e))
+  path.unlink(missing_ok=True)
+
+def connect(runtime,background=False):
+ def attempt():
+  s=socket.socket(socket.AF_UNIX)
+  try: s.connect(str(runtime/'dispenser.sock')); return s
+  except Exception: s.close(); raise
+ try: return attempt()
+ except (FileNotFoundError,ConnectionRefusedError): pass
+ with open(runtime/'start.lock','a') as lock:
+  fcntl.flock(lock,fcntl.LOCK_EX)
+  try: return attempt()
+  except (FileNotFoundError,ConnectionRefusedError): pass
+  with open(STATE/'dispenser.log','ab') as out:
+   env=dict(os.environ,ANDROID_VM_DISPENSER_BACKGROUND='1' if background else '0')
+   p=subprocess.Popen([sys.executable,str(Path(__file__).resolve()),'serve'],stdin=subprocess.DEVNULL,stdout=out,stderr=out,start_new_session=True,env=env)
+  for _ in range(100):
+   try: return attempt()
+   except (FileNotFoundError,ConnectionRefusedError):
+    if p.poll() is not None: raise RuntimeError('dispenser failed to start; inspect '+str(STATE/'dispenser.log'))
+    time.sleep(.05)
+  raise RuntimeError('dispenser startup timed out')
+
+@contextlib.contextmanager
+def lease(cancel=None,owner_token=None):
+ instance=owner_token if owner_token is not None else secrets.token_hex(32)
+ runtime=setup(); s=connect(runtime)
+ viewer_stop=threading.Event(); viewer_thread=None
+ if cancel is not None:
+  def cancel_wait():
+   cancel.wait()
+   with contextlib.suppress(OSError): s.shutdown(socket.SHUT_RDWR)
+  threading.Thread(target=cancel_wait,daemon=True).start()
+ try:
+  send(s,{'op':'acquire','instance':instance}); log('Waiting for isolated Android VM and ADB readiness...')
+  r=receive(s)
+  if not r.get('ok'): raise RuntimeError(r.get('error'))
+  log('VM ready (instance '+r['id']+').')
+  c=config()
+  # The running dispenser owns viewer policy; clients must honor startup overrides.
+  c['auto_view']=r.get('auto_view',c['auto_view'])
+  auto_view(r['id'],c)
+  if c['auto_view']:
+   viewer_thread=threading.Thread(target=keep_viewer,args=(r['id'],viewer_stop,cancel),daemon=True)
+   viewer_thread.start()
+  yield c,r['port'],s
+ finally:
+  viewer_stop.set()
+  if viewer_thread is not None: viewer_thread.join()
+  s.close()
+
+def bounded(cmd,timeout,stdin=None,cancel=None,limit=65536,binary=False):
+ p=subprocess.Popen(cmd,stdin=stdin if stdin is not None else subprocess.DEVNULL,stdout=subprocess.PIPE,stderr=subprocess.PIPE,start_new_session=True)
+ buffers={p.stdout:bytearray(),p.stderr:bytearray()}; truncated=False; timed_out=False
+ sel=selectors.DefaultSelector()
+ for stream in buffers: sel.register(stream,selectors.EVENT_READ)
+ deadline=time.monotonic()+timeout
+ try:
+  while sel.get_map():
+   if time.monotonic()>deadline or (cancel is not None and cancel.is_set()):
+    timed_out=True
+    with contextlib.suppress(ProcessLookupError): os.killpg(p.pid,signal.SIGKILL)
+    deadline=float('inf'); cancel=None
+   for key,_ in sel.select(.1):
+    data=os.read(key.fileobj.fileno(),65536)
+    if not data: sel.unregister(key.fileobj); continue
+    room=limit-len(buffers[key.fileobj]); buffers[key.fileobj].extend(data[:room]); truncated |= len(data)>room
+  code=p.wait()
+ finally:
+  sel.close()
+  if p.poll() is None: os.killpg(p.pid,signal.SIGKILL); p.wait()
+  p.stdout.close(); p.stderr.close()
+ return {'exit_code':code,'stdout':bytes(buffers[p.stdout]) if binary else buffers[p.stdout].decode(errors='replace'),'stderr':buffers[p.stderr].decode(errors='replace'),'truncated':truncated,'timed_out':timed_out}
+
+def execute(c,port,args,cancel=None):
+ argv=args.get('argv'); timeout=args.get('timeout_sec',60)
+ if not isinstance(argv,list) or not argv or not all(isinstance(a,str) and '\0' not in a for a in argv) or not argv[0]: raise ValueError('argv must be a nonempty array of strings')
+ if type(timeout) is not int or not 1<=timeout<=300: raise ValueError('timeout_sec must be 1..300')
+ # Guest toybox timeout ensures the remote command stops even when ADB disconnects.
+ result=bounded(adb(c,port)+[shlex.join(['timeout','-k','2',str(timeout)]+argv)],timeout+8,cancel=cancel)
+ result['timed_out'] |= result['exit_code']==124
+ return result
+
+def upload(c,port,args,cancel=None):
+ local=args.get('local_path'); guest=args.get('guest_path'); executable=args.get('executable',False)
+ if not isinstance(local,str) or not os.path.isabs(local) or not Path(local).is_file(): raise ValueError('local_path must be an absolute regular file on the MCP host')
+ if not isinstance(guest,str) or not os.path.isabs(guest) or '\0' in guest or guest.endswith('/'): raise ValueError('guest_path must be an absolute file path')
+ if type(executable) is not bool: raise ValueError('executable must be boolean')
+ with open(local,'rb') as src:
+  h=hashlib.sha256(); size=0
+  for block in iter(lambda: src.read(1048576),b''): h.update(block); size+=len(block)
+ temporary=str(Path(guest).parent/('.dispenser-'+uuid.uuid4().hex))
+ try:
+  result=bounded(adb(c,port)[:-2]+['push',local,temporary],130,cancel=cancel)
+  if result['exit_code']!=0: raise RuntimeError('upload failed: '+result['stderr'])
+  digest=execute(c,port,{'argv':['sha256sum',temporary]},cancel=cancel)
+  if digest['exit_code'] or digest['stdout'].split()[0]!=h.hexdigest(): raise RuntimeError('uploaded file checksum mismatch')
+  command=shlex.join(['chmod','0755' if executable else '0644',temporary])+' && '+shlex.join(['mv','-f',temporary,guest])
+  result=execute(c,port,{'argv':['sh','-c',command]},cancel=cancel)
+  if result['exit_code']: raise RuntimeError('upload publish failed: '+result['stderr'])
+ finally:
+  bounded(adb(c,port)+[shlex.join(['rm','-f',temporary])],5)
+ return {'sha256':h.hexdigest(),'bytes':size,'guest_path':guest}
+
+def mcp():
+ incoming=queue.Queue(); cancelled=threading.Event()
+ def emit(obj): print(json.dumps(obj,separators=(',',':')),flush=True)
+ def read_input():
+  try:
+   buffered=bytearray()
+   while True:
+    chunk=os.read(sys.stdin.fileno(),65536)
+    if not chunk: break
+    buffered.extend(chunk)
+    while b'\n' in buffered:
+     line,_,rest=buffered.partition(b'\n'); buffered=bytearray(rest); incoming.put(bytes(line))
+  finally: cancelled.set(); incoming.put(None)
+ threading.Thread(target=read_input,daemon=True).start()
+ with lease(cancel=cancelled,owner_token=os.environ.get('ANDROID_VM_DISPENSER_OWNER_TOKEN')) as (c,port,control), InteractionSession(c,port,cancelled) as interaction:
+  def watch():
+   try: control.recv(1)
+   except OSError: pass
+   cancelled.set(); incoming.put(None)
+  threading.Thread(target=watch,daemon=True).start()
+  while not cancelled.is_set():
+   line=incoming.get()
+   if line is None: break
+   try: req=json.loads(line)
+   except ValueError:
+    emit({'jsonrpc':'2.0','id':None,'error':{'code':-32700,'message':'Parse error'}}); continue
+   if not isinstance(req,dict) or req.get('jsonrpc')!='2.0' or not isinstance(req.get('method'),str):
+    emit({'jsonrpc':'2.0','id':None,'error':{'code':-32600,'message':'Invalid request'}}); continue
+   if 'id' not in req: continue
+   response={'jsonrpc':'2.0','id':req['id']}
+   control.sendall(b'B')
+   try:
+    method=req['method']; params=req.get('params',{})
+    if not isinstance(params,dict): raise ValueError('params must be an object')
+    if method=='initialize':
+     version=params.get('protocolVersion')
+     response['result']={'protocolVersion':version if version in ('2024-11-05','2025-03-26','2025-06-18') else '2024-11-05','capabilities':{'tools':{}},'serverInfo':{'name':'android-vm-dispenser','version':'1.0.0'}}
+    elif method=='ping': response['result']={}
+    elif method=='tools/list': response['result']={'tools':TOOLS}
+    elif method=='tools/call':
+     name=params.get('name'); args=params.get('arguments',{})
+     if not isinstance(args,dict): raise ValueError('arguments must be an object')
+     if name not in {t['name'] for t in TOOLS}: raise ValueError('unknown tool')
+     try:
+      if name=='screenshot':
+       body=screenshot(c,port,cancelled)
+      else:
+       if name=='upload': result=upload(c,port,args,cancel=cancelled)
+       elif name in ('install_app','run_app'): result=cli_app(c,port,name,args,cancelled)
+       elif name=='ui_hierarchy': result=layout(c,port,cancelled)
+       elif name in UI_TOOLS: result=interaction.call(name,args)
+       else:
+        if name=='tap':
+         if any(type(args.get(k)) is not int or args[k]<0 for k in ('x','y')): raise ValueError('x and y must be nonnegative integers')
+         args={'argv':['input','tap',str(args['x']),str(args['y'])]}
+        elif name=='keyevent':
+         key=args.get('key')
+         if not isinstance(key,str) or not re.fullmatch(r'(KEYCODE_[A-Z0-9_]+|[0-9]+)',key): raise ValueError('invalid Android key code')
+         args={'argv':['input','keyevent',key]}
+        result=execute(c,port,args,cancel=cancelled)
+       body={'content':[{'type':'text','text':json.dumps(result)}],'isError':bool(result.get('exit_code',0))}
+     except Exception as e: body={'content':[{'type':'text','text':str(e)}],'isError':True}
+     response['result']=body
+    else: response['error']={'code':-32601,'message':'Method not found'}
+   except ValueError as e: response['error']={'code':-32602,'message':str(e)}
+   finally:
+    with contextlib.suppress(OSError): control.sendall(b'I')
+   emit(response)
+
+
+def auto_view(key,c):
+ if not c['auto_view']: return
+ try: launch_viewer(key)
+ except Exception as e: log('Host viewer could not open: '+str(e)+'.')
+
+def keep_viewer(key,stopped,cancel=None):
+ last_error=None
+ while not stopped.wait(3):
+  if cancel is not None and cancel.is_set(): return
+  record=STATE/'instances'/key/'record.json'
+  try:
+   r=json.loads(record.read_text())
+   if r.get('id')!=key or not alive(r): return
+   launch_viewer(key)
+   last_error=None
+  except FileNotFoundError:
+   if not record.exists(): return
+  except Exception as e:
+   error=str(e)
+   if error!=last_error: log('Host viewer recovery failed: '+error+'.')
+   last_error=error
+
+def viewer_windows(runtime):
+ # Only this dispenser state's recorded, still-running viewer processes count.
+ owned={}
+ for marker in runtime.glob('*.viewer.json'):
+  try:
+   saved=json.loads(marker.read_text())
+   pid=int(saved['pid'])
+   title='Android '+marker.name[:12]
+   command=Path('/proc/'+str(pid)+'/cmdline').read_bytes().split(b'\0')
+   if saved['url'].encode() in command and title.encode() in command and any(Path(os.fsdecode(part)).name=='scrcpy' for part in command if part):
+    owned[pid]=title
+  except (OSError,ValueError,KeyError,TypeError): continue
+ # Read actual positions, including viewers moved manually since they opened.
+ result=subprocess.run(['xwininfo','-root','-tree'],capture_output=True,text=True,check=True,timeout=2)
+ pattern=r'^\s*(0x[0-9a-f]+) "(Android [^"]+)": \("(?:scrcpy|android-vm-dispenser-viewer)" "(?:scrcpy|Scrcpy)"\)\s+(\d+)x(\d+)[+-]\d+[+-]\d+\s+([+-]\d+)([+-]\d+)'
+ windows=[]
+ for w,title,width,height,x,y in re.findall(pattern,result.stdout,re.MULTILINE):
+  if not any(title==t or title.startswith(t+' (') for t in owned.values()): continue
+  result=subprocess.run(['xprop','-id',w,'_NET_WM_PID'],capture_output=True,text=True,timeout=2)
+  match=re.search(r'_NET_WM_PID\(CARDINAL\) = (\d+)',result.stdout)
+  expected=owned.get(int(match[1])) if match else None
+  if expected and (title==expected or title.startswith(expected+' (')):
+   windows.append((int(w,16),title,int(x),int(y),int(width),int(height)))
+ return windows
+
+def viewer_slots(window):
+ def cardinals(args,name):
+  result=subprocess.run(['xprop',*args,name],capture_output=True,text=True,check=True,timeout=2)
+  match=re.search(re.escape(name)+r'\(CARDINAL\) = ([\d, ]+)',result.stdout)
+  return [int(v) for v in match[1].split(',')] if match else []
+ work=cardinals(['-root'],'_NET_WORKAREA')
+ if len(work)<4: raise RuntimeError('desktop work area is unavailable')
+ left,top,width,height=work[:4]
+ # Four viewers share one row within the same overall desktop area.
+ column=width//4; grid_height=height//2
+ visible_width=column//4; visible_height=grid_height
+ if min(visible_width,visible_height)<100: raise RuntimeError('desktop work area is too small')
+ frame=cardinals(['-id',hex(window)],'_GTK_FRAME_EXTENTS')
+ if len(frame)!=4:
+  frame=cardinals(['-id',hex(window)],'_NET_FRAME_EXTENTS')
+  frame=[-v for v in frame] if len(frame)==4 else [0,0,0,0]
+ l,r,t,b=frame
+ # GTK extents are invisible shadows; traditional WM extents are decorations.
+ x=left+width-column-l
+ return [(x+col*column//4,top-t,
+          (col+1)*column//4-col*column//4+l+r,
+          visible_height+t+b)
+         for col in range(4)]
+
+def place_viewer(key,pid,runtime):
+ if not os.environ.get('DISPLAY') or not all(shutil.which(tool) for tool in ('xwininfo','xprop')):
+  log('Viewer placement requires DISPLAY, xwininfo, and xprop.'); return
+ try:
+  # Serialize discovery and placement across VMs, so concurrent launches see
+  # the previous window's final position before choosing their own slot.
+  with open(runtime/'viewer-placement.lock','a') as lock:
+   fcntl.flock(lock,fcntl.LOCK_EX)
+   deadline=time.monotonic()+5
+   while True:
+    windows=viewer_windows(runtime)
+    target=next((w for w in windows if w[1].startswith('Android '+key[:12])),None)
+    if target: break
+    if not Path('/proc/'+str(pid)).exists() or time.monotonic()>=deadline:
+     raise RuntimeError('viewer window did not appear within five seconds')
+    time.sleep(.1)
+   slots=viewer_slots(target[0])
+   # Count windows by their nearest slot: frame shadows slightly overlap the
+   # other slot even when a viewer is correctly positioned.
+   occupied=[0]*len(slots)
+   for window in windows:
+    if window[0]==target[0]: continue
+    _,_,x,y,width,height=window
+    if not any(x+width>sx and x<sx+sw and y+height>sy and y<sy+sh for sx,sy,sw,sh in slots): continue
+    nearest=min(range(len(slots)),key=lambda i: (x-slots[i][0])**2+(y-slots[i][1])**2)
+    occupied[nearest]+=1
+   x,y,slot_width,slot_height=slots[min(range(len(slots)),key=lambda i: occupied[i])]
+   # Xlib is already present on hosts running remote-viewer; avoid requiring
+   # an extra window-management utility or Python package.
+   lib=ctypes.CDLL('libX11.so.6')
+   lib.XOpenDisplay.argtypes=[ctypes.c_char_p]; lib.XOpenDisplay.restype=ctypes.c_void_p
+   lib.XMoveResizeWindow.argtypes=[ctypes.c_void_p,ctypes.c_ulong,ctypes.c_int,ctypes.c_int,ctypes.c_uint,ctypes.c_uint]
+   lib.XSync.argtypes=[ctypes.c_void_p,ctypes.c_int]
+   lib.XCloseDisplay.argtypes=[ctypes.c_void_p]
+   class SizeHints(ctypes.Structure):
+    _fields_=[('flags',ctypes.c_long)]+[(name,ctypes.c_int) for name in
+     ('x','y','width','height','min_width','min_height','max_width','max_height',
+      'width_inc','height_inc','min_aspect_x','min_aspect_y','max_aspect_x','max_aspect_y',
+      'base_width','base_height','win_gravity')]
+   lib.XGetWMNormalHints.argtypes=[ctypes.c_void_p,ctypes.c_ulong,ctypes.POINTER(SizeHints),ctypes.POINTER(ctypes.c_long)]
+   lib.XSetWMNormalHints.argtypes=[ctypes.c_void_p,ctypes.c_ulong,ctypes.POINTER(SizeHints)]
+   lib.XSelectInput.argtypes=[ctypes.c_void_p,ctypes.c_ulong,ctypes.c_long]
+   lib.XConnectionNumber.argtypes=[ctypes.c_void_p]
+   lib.XPending.argtypes=[ctypes.c_void_p]
+   lib.XNextEvent.argtypes=[ctypes.c_void_p,ctypes.c_void_p]
+   class WMHints(ctypes.Structure):
+    _fields_=[('flags',ctypes.c_long),('input',ctypes.c_int),('initial_state',ctypes.c_int),
+     ('icon_pixmap',ctypes.c_ulong),('icon_window',ctypes.c_ulong),('icon_x',ctypes.c_int),
+     ('icon_y',ctypes.c_int),('icon_mask',ctypes.c_ulong),('window_group',ctypes.c_ulong)]
+   lib.XGetWMHints.argtypes=[ctypes.c_void_p,ctypes.c_ulong]; lib.XGetWMHints.restype=ctypes.POINTER(WMHints)
+   lib.XSetWMHints.argtypes=[ctypes.c_void_p,ctypes.c_ulong,ctypes.POINTER(WMHints)]
+   lib.XFree.argtypes=[ctypes.c_void_p]
+   lib.XInternAtom.argtypes=[ctypes.c_void_p,ctypes.c_char_p,ctypes.c_int]; lib.XInternAtom.restype=ctypes.c_ulong
+   lib.XGetWMProtocols.argtypes=[ctypes.c_void_p,ctypes.c_ulong,ctypes.POINTER(ctypes.POINTER(ctypes.c_ulong)),ctypes.POINTER(ctypes.c_int)]
+   lib.XSetWMProtocols.argtypes=[ctypes.c_void_p,ctypes.c_ulong,ctypes.POINTER(ctypes.c_ulong),ctypes.c_int]
+   lib.XGetInputFocus.argtypes=[ctypes.c_void_p,ctypes.POINTER(ctypes.c_ulong),ctypes.POINTER(ctypes.c_int)]
+   lib.XSetInputFocus.argtypes=[ctypes.c_void_p,ctypes.c_ulong,ctypes.c_int,ctypes.c_ulong]
+   lib.XQueryTree.argtypes=[ctypes.c_void_p,ctypes.c_ulong,ctypes.POINTER(ctypes.c_ulong),ctypes.POINTER(ctypes.c_ulong),ctypes.POINTER(ctypes.POINTER(ctypes.c_ulong)),ctypes.POINTER(ctypes.c_uint)]
+   shape=ctypes.CDLL('libXext.so.6')
+   shape.XShapeCombineRectangles.argtypes=[ctypes.c_void_p,ctypes.c_ulong,ctypes.c_int,ctypes.c_int,ctypes.c_int,ctypes.c_void_p,ctypes.c_int,ctypes.c_int,ctypes.c_int]
+   shape.XShapeCombineMask.argtypes=[ctypes.c_void_p,ctypes.c_ulong,ctypes.c_int,ctypes.c_int,ctypes.c_int,ctypes.c_ulong,ctypes.c_int]
+   lib.XGetGeometry.argtypes=[ctypes.c_void_p,ctypes.c_ulong,ctypes.POINTER(ctypes.c_ulong),ctypes.POINTER(ctypes.c_int),ctypes.POINTER(ctypes.c_int),ctypes.POINTER(ctypes.c_uint),ctypes.POINTER(ctypes.c_uint),ctypes.POINTER(ctypes.c_uint),ctypes.POINTER(ctypes.c_uint)]
+   lib.XTranslateCoordinates.argtypes=[ctypes.c_void_p,ctypes.c_ulong,ctypes.c_ulong,ctypes.c_int,ctypes.c_int,ctypes.POINTER(ctypes.c_int),ctypes.POINTER(ctypes.c_int),ctypes.POINTER(ctypes.c_ulong)]
+   lib.XSetTransientForHint.argtypes=[ctypes.c_void_p,ctypes.c_ulong,ctypes.c_ulong]
+   lib.XChangeProperty.argtypes=[ctypes.c_void_p,ctypes.c_ulong,ctypes.c_ulong,ctypes.c_ulong,ctypes.c_int,ctypes.c_int,ctypes.c_void_p,ctypes.c_int]
+   error_handler_type=ctypes.CFUNCTYPE(ctypes.c_int,ctypes.c_void_p,ctypes.c_void_p)
+   lib.XSetErrorHandler.argtypes=[ctypes.c_void_p]; lib.XSetErrorHandler.restype=ctypes.c_void_p
+   errors=[]
+   @error_handler_type
+   def on_error(display,event):
+    errors.append(True); return 0
+   display=lib.XOpenDisplay(None)
+   if not display: raise RuntimeError('cannot open X display')
+   previous_handler=lib.XSetErrorHandler(ctypes.cast(on_error,ctypes.c_void_p))
+   toolbar=None
+   try:
+    interactive=False
+    original_protocols=ctypes.POINTER(ctypes.c_ulong)(); original_count=ctypes.c_int()
+    protocols_saved=[]
+    if lib.XGetWMProtocols(display,target[0],ctypes.byref(original_protocols),ctypes.byref(original_count)):
+     try: protocols_saved=[original_protocols[i] for i in range(original_count.value)]
+     finally: lib.XFree(original_protocols)
+    def disable_input():
+     # Empty input region makes the entire viewer (including chrome) click-through.
+     shape.XShapeCombineRectangles(display,target[0],2,0,0,None,0,0,0)
+     hints=lib.XGetWMHints(display,target[0])
+     try:
+      value=hints.contents if hints else WMHints()
+      if not value.flags&1 or value.input:
+       value.flags|=1; value.input=0
+       lib.XSetWMHints(display,target[0],ctypes.byref(value))
+     finally:
+      if hints: lib.XFree(hints)
+     protocols=ctypes.POINTER(ctypes.c_ulong)(); count=ctypes.c_int()
+     if lib.XGetWMProtocols(display,target[0],ctypes.byref(protocols),ctypes.byref(count)):
+      try:
+       take_focus=lib.XInternAtom(display,b'WM_TAKE_FOCUS',False)
+       kept=[protocols[i] for i in range(count.value) if protocols[i]!=take_focus]
+       if len(kept)!=count.value:
+        lib.XSetWMProtocols(display,target[0],(ctypes.c_ulong*len(kept))(*kept),len(kept))
+      finally: lib.XFree(protocols)
+     focused=ctypes.c_ulong(); revert=ctypes.c_int()
+     lib.XGetInputFocus(display,ctypes.byref(focused),ctypes.byref(revert))
+     ancestor=focused.value
+     for _ in range(32):
+      if ancestor==target[0]:
+       lib.XSetInputFocus(display,1,0,0); break # PointerRoot
+      if ancestor in (0,1): break
+      root=ctypes.c_ulong(); parent=ctypes.c_ulong(); children=ctypes.POINTER(ctypes.c_ulong)(); n=ctypes.c_uint()
+      if not lib.XQueryTree(display,ancestor,ctypes.byref(root),ctypes.byref(parent),ctypes.byref(children),ctypes.byref(n)): break
+      if children: lib.XFree(children)
+      if ancestor==root.value: break
+      ancestor=parent.value
+    disable_input()
+    def toggle_input():
+     nonlocal interactive
+     interactive=not interactive
+     if interactive:
+      shape.XShapeCombineMask(display,target[0],2,0,0,0,0)
+      hints=lib.XGetWMHints(display,target[0])
+      try:
+       value=hints.contents if hints else WMHints()
+       value.flags|=1; value.input=1
+       lib.XSetWMHints(display,target[0],ctypes.byref(value))
+      finally:
+       if hints: lib.XFree(hints)
+      lib.XSetWMProtocols(display,target[0],(ctypes.c_ulong*len(protocols_saved))(*protocols_saved),len(protocols_saved))
+     else: disable_input()
+     button.configure(text='Interactive ⇄' if interactive else 'View only ⇄',
+                      background='#d5f5df' if interactive else '#eeeeee')
+     lib.XSync(display,False)
+    # remote-viewer requests its natural window size on every guest display
+    # update. A one-time move/resize is insufficient: keep a WM size ceiling.
+    def limit_size():
+     hints=SizeHints(); supplied=ctypes.c_long()
+     lib.XGetWMNormalHints(display,target[0],ctypes.byref(hints),ctypes.byref(supplied))
+     if hints.flags&(1<<5) and (hints.max_width,hints.max_height)==(slot_width,slot_height): return
+     hints.flags|=1<<5 # PMaxSize
+     hints.max_width=slot_width; hints.max_height=slot_height
+     hints.min_width=min(hints.min_width,slot_width); hints.min_height=min(hints.min_height,slot_height)
+     lib.XSetWMNormalHints(display,target[0],ctypes.byref(hints))
+    lib.XSelectInput(display,target[0],(1<<22)|(1<<17)) # PropertyChange / StructureNotify
+    limit_size()
+    lib.XMoveResizeWindow(display,target[0],x,y,slot_width,slot_height)
+    lib.XSync(display,False)
+    if errors: raise RuntimeError('viewer window disappeared during placement')
+    deadline=time.monotonic()+3
+    while time.monotonic()<deadline:
+     limit_size()
+     lib.XMoveResizeWindow(display,target[0],x,y,slot_width,slot_height)
+     lib.XSync(display,False)
+     time.sleep(.1)
+    if not any(w[0]==target[0] and w[2:]==(x,y,slot_width,slot_height) for w in viewer_windows(runtime)):
+     raise RuntimeError('window manager did not apply the requested position and size')
+    fcntl.flock(lock,fcntl.LOCK_UN)
+    import tkinter as tk
+    toolbar=tk.Tk()
+    toolbar.withdraw()
+    button=tk.Button(toolbar,text='View only ⇄',command=toggle_input,takefocus=False,
+                     background='#eeeeee',font=('Sans',9),borderwidth=1)
+    button.pack(fill='both',expand=True)
+    toolbar.update_idletasks()
+    toolbar_height=toolbar.winfo_reqheight()
+    # The window manager stacks, minimizes and hides a transient window
+    # together with its parent, so the toolbar is only visible with the viewer.
+    toolbar_window=ctypes.c_ulong(); _root=ctypes.c_ulong(); _children=ctypes.POINTER(ctypes.c_ulong)(); _count=ctypes.c_uint()
+    if not lib.XQueryTree(display,toolbar.winfo_id(),ctypes.byref(_root),ctypes.byref(toolbar_window),ctypes.byref(_children),ctypes.byref(_count)):
+     raise RuntimeError('cannot find the toolbar window')
+    if _children: lib.XFree(_children)
+    toolbar_window=toolbar_window.value # Tk wrapper window, which the WM manages
+    lib.XSetTransientForHint(display,toolbar_window,target[0])
+    motif=lib.XInternAtom(display,b'_MOTIF_WM_HINTS',False)
+    lib.XChangeProperty(display,toolbar_window,motif,motif,32,0,(ctypes.c_long*5)(2,0,0,0,0),5) # no decorations
+    def keep_focus_off_toolbar():
+     hints=lib.XGetWMHints(display,toolbar_window)
+     try:
+      value=hints.contents if hints else WMHints()
+      if not value.flags&1 or value.input:
+       value.flags|=1; value.input=0
+       lib.XSetWMHints(display,toolbar_window,ctypes.byref(value))
+     finally:
+      if hints: lib.XFree(hints)
+    def position_toolbar():
+     root=ctypes.c_ulong(); gx=ctypes.c_int(); gy=ctypes.c_int()
+     width=ctypes.c_uint(); height=ctypes.c_uint(); border=ctypes.c_uint(); depth=ctypes.c_uint()
+     if not lib.XGetGeometry(display,target[0],ctypes.byref(root),ctypes.byref(gx),ctypes.byref(gy),ctypes.byref(width),ctypes.byref(height),ctypes.byref(border),ctypes.byref(depth)): return
+     child=ctypes.c_ulong()
+     if lib.XTranslateCoordinates(display,target[0],root.value,0,0,ctypes.byref(gx),ctypes.byref(gy),ctypes.byref(child)):
+      geometry=f'{width.value}x{toolbar_height}{gx.value:+d}{gy.value+height.value:+d}'
+      if geometry!=getattr(position_toolbar,'last',None):
+       toolbar.geometry(geometry); position_toolbar.last=geometry
+    position_toolbar()
+    toolbar.deiconify()
+    toolbar.update_idletasks()
+    keep_focus_off_toolbar()
+    lib.XSync(display,False)
+    # GTK replaces WM_NORMAL_HINTS during initialization and display updates.
+    # Watch that window's events in this dedicated process, retaining its cap
+    # without polling desktop windows or moving a manually repositioned viewer.
+    event=(ctypes.c_long*24)()
+    while not errors:
+     try: command=Path('/proc/'+str(pid)+'/cmdline').read_bytes().split(b'\0')
+     except OSError: break
+     if ('Android '+key[:12]).encode() not in command: break
+     if not lib.XPending(display):
+      __import__('select').select([lib.XConnectionNumber(display)],[],[],.1)
+     while lib.XPending(display): lib.XNextEvent(display,ctypes.byref(event))
+     limit_size()
+     if not interactive: disable_input()
+     lib.XSync(display,False)
+     if errors: break
+     position_toolbar()
+     toolbar.update()
+   finally:
+    if toolbar is not None: toolbar.destroy()
+    lib.XCloseDisplay(display)
+    lib.XSetErrorHandler(previous_handler)
+ except (OSError,ValueError,RuntimeError,subprocess.SubprocessError) as e:
+  log('Host viewer opened, but placement failed: '+str(e))
+
+def launch_viewer(key):
+ if len(key)!=32 or any(ch not in '0123456789abcdef' for ch in key): raise ValueError('invalid viewer instance ID')
+ record=STATE/'instances'/key/'record.json'
+ r=json.loads(record.read_text())
+ if r.get('id')!=key or not alive(r): raise RuntimeError('instance is not running')
+ c=config(); runtime=setup(); serial='emulator-'+str(c['port_start']+2*r['slot'])
+ executable=c.get('viewer',shutil.which('scrcpy'))
+ if not executable: raise RuntimeError('scrcpy is not installed')
+ with open(runtime/(key+'.view.lock'),'a') as lock:
+  fcntl.flock(lock,fcntl.LOCK_EX)
+  if not record.is_file() or not alive(r): raise RuntimeError('instance stopped')
+  marker=runtime/(key+'.viewer.json')
+  try:
+   saved=json.loads(marker.read_text())
+   command=Path('/proc/'+str(saved['pid'])+'/cmdline').read_bytes().split(b'\0')
+   if serial.encode() in command and ('Android '+key[:12]).encode() in command and any(Path(os.fsdecode(x)).name=='scrcpy' for x in command if x):
+    if b'--no-control' not in command: return serial
+    os.kill(saved['pid'],signal.SIGTERM)
+    deadline=time.monotonic()+3
+    while True:
+     try: remaining=Path('/proc/'+str(saved['pid'])+'/cmdline').read_bytes()
+     except FileNotFoundError: break
+     if not remaining: break
+     if time.monotonic()>=deadline: raise RuntimeError('old view-only viewer did not exit')
+     time.sleep(.05)
+  except (OSError,ValueError,KeyError): pass
+  if not (os.environ.get('DISPLAY') or os.environ.get('WAYLAND_DISPLAY')): raise RuntimeError('no graphical session')
+  env=dict(os.environ,ADB=str(Path(c['sdk'])/'platform-tools/adb'))
+  env['SDL_WINDOW_ACTIVATE_WHEN_SHOWN']='0'
+  env['SDL_WINDOW_ACTIVATE_WHEN_RAISED']='0'
+  if env.get('DISPLAY'): env['SDL_VIDEO_DRIVER']='x11'
+  with open(STATE/'viewer.log','ab') as out:
+   proc=subprocess.Popen([executable,'--serial',serial,'--no-audio','--no-clipboard-autosync','--no-window-aspect-ratio-lock','--window-borderless','--window-title','Android '+key[:12],'--window-width','360','--window-height','640'],stdin=subprocess.DEVNULL,stdout=out,stderr=out,start_new_session=True,env=env)
+  atomic(marker,{'pid':proc.pid,'url':serial})
+  try: code=proc.wait(timeout=.2)
+  except subprocess.TimeoutExpired: pass
+  else: raise RuntimeError('scrcpy exited: '+str(code))
+  with open(STATE/'viewer.log','ab') as out:
+   watcher="import runpy,sys; b=runpy.run_path(sys.argv[1],run_name='viewer_watcher'); b['place_viewer'](sys.argv[2],int(sys.argv[3]),b['setup']())"
+   subprocess.Popen([sys.executable,'-c',watcher,str(Path(__file__).resolve()),key,str(proc.pid)],stdin=subprocess.DEVNULL,stdout=out,stderr=out,start_new_session=True)
+ return serial
+
+
+def main():
+ parser=argparse.ArgumentParser(description=__doc__)
+ sub=parser.add_subparsers(dest='command',required=True)
+ for command in ('mcp','upload'):
+  p=sub.add_parser(command)
+  if command=='upload': p.add_argument('--executable',action='store_true'); p.add_argument('local_path'); p.add_argument('guest_path')
+ for command in ('serve','stop','restart'): sub.add_parser(command)
+ p=sub.add_parser('start'); p.add_argument('--background',action='store_true',help='start the dispenser with automatic viewers disabled')
+ args=parser.parse_args()
+ # EOF, signal termination and ordinary errors all close the lease socket.
+ def interrupted(signum,frame): raise KeyboardInterrupt()
+ signal.signal(signal.SIGTERM,interrupted)
+ try:
+  runtime=setup()
+  if args.command=='serve':
+   c=config()
+   if os.environ.get('ANDROID_VM_DISPENSER_BACKGROUND')=='1': c['auto_view']=False
+   with open(runtime/'daemon.lock','a') as lock:
+    fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB); Dispenser(c,runtime).serve()
+   return
+  if args.command in ('start','stop','restart'):
+   req={'op':'status' if args.command in ('start','restart') else 'shutdown'}
+   background=args.command=='start' and args.background
+   with connect(runtime,background=background) as sock: send(sock,req); r=receive(sock)
+   if not r.get('ok'): raise RuntimeError(r.get('error'))
+   if background and r.get('config',{}).get('auto_view') is not False:
+    raise RuntimeError('dispenser is already running without confirmed background mode; run stop after active leases finish, then start --background')
+   if args.command=='restart':
+    background=r.get('config',{}).get('auto_view',config()['auto_view']) is False
+    with connect(runtime) as sock: send(sock,{'op':'shutdown'}); r=receive(sock)
+    if not r.get('ok'): raise RuntimeError(r.get('error'))
+   if args.command in ('stop','restart'):
+    # The reply acknowledges the request; the daemon still owns its listener
+    # until cleanup finishes. Do not let a following command reconnect to it.
+    with open(runtime/'start.lock','a') as start_lock:
+     fcntl.flock(start_lock,fcntl.LOCK_EX)
+     with open(runtime/'daemon.lock','a') as daemon_lock:
+      fcntl.flock(daemon_lock,fcntl.LOCK_EX)
+   if args.command=='restart':
+    with connect(runtime,background=background) as sock: send(sock,{'op':'status'}); r=receive(sock)
+    if not r.get('ok'): raise RuntimeError(r.get('error'))
+   print(json.dumps(r,indent=2)); return
+  if args.command=='mcp': mcp()
+  else:
+   with lease() as (c,port,control):
+    control.sendall(b'B')
+    result=upload(c,port,vars(args))
+    print(json.dumps(result,indent=2))
+    if result.get('exit_code',0): sys.exit(1)
+ except KeyboardInterrupt: sys.exit(130)
+ except Exception as e: log('android-vm-dispenser: '+str(e)); sys.exit(1)
+
+if __name__=='__main__': main()
